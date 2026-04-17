@@ -10,9 +10,10 @@ User=root
 Group=root
 WorkingDirectory=/root/.hermes/hermes-agent
 Environment=HERMES_HOME=/root/.hermes
-# Optional: duplicate keys here override .env (useful for overrides without editing .env)
-# Environment=HERMES_API_SERVER_DISABLE_CODE_EXECUTION=true
 EnvironmentFile=-/root/.hermes/.env
+# After EnvironmentFile: strip execute_code for Lumii API unless you remove this line.
+# (HERMES_API_SERVER_DISABLE_CODE_EXECUTION=false in .env does NOT disable the tool — use true, or rely on this.)
+Environment=HERMES_API_SERVER_DISABLE_CODE_EXECUTION=true
 ExecStart=/root/.hermes/hermes-agent/venv/bin/python -m hermes_cli.main gateway run --replace
 Restart=on-failure
 RestartSec=5

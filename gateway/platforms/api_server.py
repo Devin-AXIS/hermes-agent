@@ -602,6 +602,9 @@ class APIServerAdapter(BasePlatformAdapter):
 
         # Ephemeral /tmp sandboxes from execute_code confuse Lumii users expecting disk under
         # api_workspaces/lumii_users/.  Optionally strip the code_execution toolset (see model_tools).
+        #
+        # Semantics: only truthy values disable execute_code: 1/true/yes/on.
+        # Explicit ``false`` / ``0`` / unset → execute_code stays available (sandbox still exists).
         api_disabled_toolsets: list[str] = []
         if os.getenv("HERMES_API_SERVER_DISABLE_CODE_EXECUTION", "").strip().lower() in (
             "1",
