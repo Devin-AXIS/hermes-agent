@@ -1,0 +1,26 @@
+[Unit]
+Description=Hermes Agent Gateway (API server + messaging platforms)
+Documentation=https://github.com/Devin-AXIS/hermes-agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=/root/.hermes/hermes-agent
+Environment=HERMES_HOME=/root/.hermes
+# Optional: duplicate keys here override .env (useful for overrides without editing .env)
+# Environment=HERMES_API_SERVER_DISABLE_CODE_EXECUTION=true
+EnvironmentFile=-/root/.hermes/.env
+ExecStart=/root/.hermes/hermes-agent/venv/bin/python -m hermes_cli.main gateway run --replace
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=65535
+
+# Also in journal: journalctl -u hermes-gateway -f
+StandardOutput=append:/root/.hermes/logs/gateway.log
+StandardError=append:/root/.hermes/logs/gateway.log
+
+[Install]
+WantedBy=multi-user.target
