@@ -2152,14 +2152,22 @@ class APIServerAdapter(BasePlatformAdapter):
                     "preview": preview,
                 })
             elif event_type == "tool.completed":
-                _push({
+                # Optional tool stdout (e.g. lumii_upload_file JSON with url) for SSE clients — cap size.
+                _raw = kwargs.get("result")
+                _result = _raw if isinstance(_raw, str) else ("" if _raw is None else str(_raw))
+                if len(_result) > 12288:
+                    _result = _result[:12288] + "...[truncated]"
+                ev: Dict[str, Any] = {
                     "event": "tool.completed",
                     "run_id": run_id,
                     "timestamp": ts,
                     "tool": tool_name,
                     "duration": round(kwargs.get("duration", 0), 3),
                     "error": kwargs.get("is_error", False),
-                })
+                }
+                if _result:
+                    ev["result"] = _result
+                _push(ev)
             elif event_type == "reasoning.available":
                 _push({
                     "event": "reasoning.available",
