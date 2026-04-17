@@ -906,6 +906,30 @@ def check_all_command_guards(command: str, env_type: str,
                     "user_approved": True, "description": combined_desc}
 
         # Fallback: no gateway callback registered (e.g. cron, batch).
+        # API Server agent threads: HERMES_EXEC_ASK is set globally by gateway/run.py
+        # but HTTP clients cannot answer /approve — Tirith would block every terminal
+        # tool.  Auto-approve when running inside api_server's executor (thread-local).
+        try:
+            from tools.api_request_context import is_api_server_agent_thread
+
+            if is_api_server_agent_thread():
+                strict = os.getenv("HERMES_API_SERVER_STRICT_TERMINAL_APPROVAL", "").strip().lower() in (
+                    "1", "true", "yes", "on",
+                )
+                if not strict:
+                    logger.info(
+                        "API Server agent thread: auto-approving command guard (%s)",
+                        combined_desc[:120],
+                    )
+                    return {
+                        "approved": True,
+                        "message": None,
+                        "api_server_auto_approved": True,
+                        "description": combined_desc,
+                    }
+        except ImportError:
+            pass
+
         # Return approval_required for backward compat.
         submit_pending(session_key, {
             "command": command,

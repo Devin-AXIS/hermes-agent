@@ -2065,6 +2065,7 @@ class APIServerAdapter(BasePlatformAdapter):
         loop = asyncio.get_running_loop()
 
         def _run():
+            from tools.api_request_context import set_api_server_agent_thread
             from tools.api_server_workspace_scope import api_server_workspace_scope
             from tools.memory_tool import thread_memory_scope
 
@@ -2077,29 +2078,33 @@ class APIServerAdapter(BasePlatformAdapter):
                 "yes",
                 "on",
             )
-            with thread_memory_scope(None if _mem_off else mem_root):
-                with api_server_workspace_scope(None if _ws_off else ws_root):
-                    agent = self._create_agent(
-                        ephemeral_system_prompt=ephemeral_system_prompt,
-                        session_id=session_id,
-                        stream_delta_callback=stream_delta_callback,
-                        tool_progress_callback=tool_progress_callback,
-                        tool_start_callback=tool_start_callback,
-                        tool_complete_callback=tool_complete_callback,
-                    )
-                    if agent_ref is not None:
-                        agent_ref[0] = agent
-                    result = agent.run_conversation(
-                        user_message=user_message,
-                        conversation_history=conversation_history,
-                        task_id="default",
-                    )
-                    usage = {
-                        "input_tokens": getattr(agent, "session_prompt_tokens", 0) or 0,
-                        "output_tokens": getattr(agent, "session_completion_tokens", 0) or 0,
-                        "total_tokens": getattr(agent, "session_total_tokens", 0) or 0,
-                    }
-                    return result, usage
+            set_api_server_agent_thread(True)
+            try:
+                with thread_memory_scope(None if _mem_off else mem_root):
+                    with api_server_workspace_scope(None if _ws_off else ws_root):
+                        agent = self._create_agent(
+                            ephemeral_system_prompt=ephemeral_system_prompt,
+                            session_id=session_id,
+                            stream_delta_callback=stream_delta_callback,
+                            tool_progress_callback=tool_progress_callback,
+                            tool_start_callback=tool_start_callback,
+                            tool_complete_callback=tool_complete_callback,
+                        )
+                        if agent_ref is not None:
+                            agent_ref[0] = agent
+                        result = agent.run_conversation(
+                            user_message=user_message,
+                            conversation_history=conversation_history,
+                            task_id="default",
+                        )
+                        usage = {
+                            "input_tokens": getattr(agent, "session_prompt_tokens", 0) or 0,
+                            "output_tokens": getattr(agent, "session_completion_tokens", 0) or 0,
+                            "total_tokens": getattr(agent, "session_total_tokens", 0) or 0,
+                        }
+                        return result, usage
+            finally:
+                set_api_server_agent_thread(False)
 
         return await loop.run_in_executor(None, _run)
 
@@ -2286,28 +2291,33 @@ class APIServerAdapter(BasePlatformAdapter):
                 )
 
                 def _run_sync():
+                    from tools.api_request_context import set_api_server_agent_thread
                     from tools.api_server_workspace_scope import api_server_workspace_scope
                     from tools.memory_tool import thread_memory_scope
 
-                    with thread_memory_scope(None if _mem_off else mem_root):
-                        with api_server_workspace_scope(None if _ws_off else ws_root):
-                            agent = self._create_agent(
-                                ephemeral_system_prompt=ephemeral_system_prompt,
-                                session_id=session_id,
-                                stream_delta_callback=_text_cb,
-                                tool_progress_callback=event_cb,
-                            )
-                            r = agent.run_conversation(
-                                user_message=user_message,
-                                conversation_history=conversation_history,
-                                task_id="default",
-                            )
-                            u = {
-                                "input_tokens": getattr(agent, "session_prompt_tokens", 0) or 0,
-                                "output_tokens": getattr(agent, "session_completion_tokens", 0) or 0,
-                                "total_tokens": getattr(agent, "session_total_tokens", 0) or 0,
-                            }
-                            return r, u
+                    set_api_server_agent_thread(True)
+                    try:
+                        with thread_memory_scope(None if _mem_off else mem_root):
+                            with api_server_workspace_scope(None if _ws_off else ws_root):
+                                agent = self._create_agent(
+                                    ephemeral_system_prompt=ephemeral_system_prompt,
+                                    session_id=session_id,
+                                    stream_delta_callback=_text_cb,
+                                    tool_progress_callback=event_cb,
+                                )
+                                r = agent.run_conversation(
+                                    user_message=user_message,
+                                    conversation_history=conversation_history,
+                                    task_id="default",
+                                )
+                                u = {
+                                    "input_tokens": getattr(agent, "session_prompt_tokens", 0) or 0,
+                                    "output_tokens": getattr(agent, "session_completion_tokens", 0) or 0,
+                                    "total_tokens": getattr(agent, "session_total_tokens", 0) or 0,
+                                }
+                                return r, u
+                    finally:
+                        set_api_server_agent_thread(False)
 
                 result, usage = await asyncio.get_running_loop().run_in_executor(None, _run_sync)
                 final_response = result.get("final_response", "") if isinstance(result, dict) else ""

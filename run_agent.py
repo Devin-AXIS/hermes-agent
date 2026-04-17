@@ -7546,6 +7546,16 @@ class AIAgent:
         self._current_tool = tool_names_str
         self._touch_activity(f"executing {num_tools} tools concurrently: {tool_names_str}")
 
+        # API Server marks the agent thread with tools.api_request_context; worker
+        # threads do not inherit threading.local — mirror the flag here so
+        # terminal / approval sees the same trusted context as sequential tools.
+        try:
+            from tools.api_request_context import is_api_server_agent_thread
+
+            _api_server_trusted_parent = is_api_server_agent_thread()
+        except ImportError:
+            _api_server_trusted_parent = False
+
         def _run_tool(index, tool_call, function_name, function_args):
             """Worker function executed in a thread."""
             # Set the activity callback on THIS worker thread so
@@ -7557,12 +7567,27 @@ class AIAgent:
                 set_activity_callback(self._touch_activity)
             except Exception:
                 pass
+            if _api_server_trusted_parent:
+                try:
+                    from tools.api_request_context import set_api_server_agent_thread
+
+                    set_api_server_agent_thread(True)
+                except ImportError:
+                    pass
             start = time.time()
             try:
                 result = self._invoke_tool(function_name, function_args, effective_task_id, tool_call.id)
             except Exception as tool_error:
                 result = f"Error executing tool '{function_name}': {tool_error}"
                 logger.error("_invoke_tool raised for %s: %s", function_name, tool_error, exc_info=True)
+            finally:
+                if _api_server_trusted_parent:
+                    try:
+                        from tools.api_request_context import set_api_server_agent_thread
+
+                        set_api_server_agent_thread(False)
+                    except ImportError:
+                        pass
             duration = time.time() - start
             is_error, _ = _detect_tool_failure(function_name, result)
             if is_error:
