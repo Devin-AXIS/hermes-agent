@@ -639,7 +639,7 @@ def _get_env_config() -> Dict[str, Any]:
                         cwd, env_type, default_cwd)
             cwd = default_cwd
 
-    return {
+    cfg = {
         "env_type": env_type,
         "modal_mode": coerce_modal_mode(os.getenv("TERMINAL_MODAL_MODE", "auto")),
         "docker_image": os.getenv("TERMINAL_DOCKER_IMAGE", default_image),
@@ -672,6 +672,16 @@ def _get_env_config() -> Dict[str, Any]:
         "container_persistent": os.getenv("TERMINAL_CONTAINER_PERSISTENT", "true").lower() in ("true", "1", "yes"),
         "docker_volumes": _parse_env_var("TERMINAL_DOCKER_VOLUMES", "[]", json.loads, "valid JSON"),
     }
+    # API Server multi-tenant: pin local shell cwd to the same per-user tree as file tools.
+    try:
+        from tools.api_server_workspace_scope import get_api_server_workspace_root
+
+        _wr = get_api_server_workspace_root()
+        if _wr is not None and env_type == "local":
+            cfg["cwd"] = str(Path(_wr).resolve())
+    except Exception:
+        pass
+    return cfg
 
 
 def _get_modal_backend_state(modal_mode: object | None) -> Dict[str, Any]:

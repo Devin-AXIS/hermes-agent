@@ -28,6 +28,7 @@ import logging
 import os
 import re
 import tempfile
+import threading
 from contextlib import contextmanager
 from pathlib import Path
 from hermes_constants import get_hermes_home
@@ -46,12 +47,40 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+# API Server may bind a per-request/per-thread directory so multi-tenant HTTP
+# callers do not share a single MEMORY.md (see gateway/platforms/api_server.py).
+_thread_memory_root = threading.local()
+
+
+@contextmanager
+def thread_memory_scope(root: Optional[Path]):
+    """Bind ``get_memory_dir()`` to ``root`` for the current thread only (API server workers)."""
+    if root is None:
+        yield
+        return
+    r = Path(root).resolve()
+    prev = getattr(_thread_memory_root, "path", None)
+    _thread_memory_root.path = r
+    try:
+        r.mkdir(parents=True, exist_ok=True)
+        yield
+    finally:
+        if prev is None:
+            if hasattr(_thread_memory_root, "path"):
+                delattr(_thread_memory_root, "path")
+        else:
+            _thread_memory_root.path = prev
+
+
 # Where memory files live — resolved dynamically so profile overrides
 # (HERMES_HOME env var changes) are always respected.  The old module-level
 # constant was cached at import time and could go stale if a profile switch
 # happened after the first import.
 def get_memory_dir() -> Path:
     """Return the profile-scoped memories directory."""
+    override = getattr(_thread_memory_root, "path", None)
+    if override is not None:
+        return Path(override)
     return get_hermes_home() / "memories"
 
 ENTRY_DELIMITER = "\n§\n"

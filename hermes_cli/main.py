@@ -4498,7 +4498,7 @@ def _coalesce_session_name_args(argv: list) -> list:
         "chat", "model", "gateway", "setup", "whatsapp", "login", "logout", "auth",
         "status", "cron", "doctor", "config", "pairing", "skills", "tools",
         "mcp", "sessions", "insights", "version", "update", "uninstall",
-        "profile", "dashboard",
+        "profile", "dashboard", "web",
         "honcho", "claw", "plugins", "acp",
         "webhook", "memory", "dump", "debug", "backup", "import", "completion", "logs",
     }
@@ -4869,6 +4869,7 @@ Examples:
     hermes logs --since 1h        Lines from the last hour
     hermes debug share             Upload debug report for support
     hermes update                 Update to latest version
+    hermes web                    Web dashboard (alias: dashboard) at http://127.0.0.1:9119/
 
 For more help on a command:
     hermes <command> --help
@@ -6388,8 +6389,12 @@ Examples:
     # =========================================================================
     dashboard_parser = subparsers.add_parser(
         "dashboard",
+        aliases=["web"],
         help="Start the web UI dashboard",
-        description="Launch the Hermes Agent web dashboard for managing config, API keys, and sessions",
+        description=(
+            "Launch the Hermes Agent web dashboard for managing config, API keys, and sessions. "
+            "Default URL: http://127.0.0.1:9119/ (requires: pip install 'hermes-agent[web]' and cd web && npm install && npm run build)"
+        ),
     )
     dashboard_parser.add_argument("--port", type=int, default=9119, help="Port (default 9119)")
     dashboard_parser.add_argument("--host", default="127.0.0.1", help="Host (default 127.0.0.1)")

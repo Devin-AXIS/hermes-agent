@@ -118,6 +118,43 @@ def _check_sensitive_path(filepath: str) -> str | None:
     return None
 
 
+def _maybe_clamp_path_to_workspace(path: str) -> tuple[str | None, str | None]:
+    """When API server sets a per-tenant workspace, restrict file paths to that tree.
+
+    Returns ``(adjusted_path, None)`` or ``(None, error_json)``.
+    """
+    from tools.api_server_workspace_scope import get_api_server_workspace_root
+
+    root = get_api_server_workspace_root()
+    if root is None:
+        return path, None
+    try:
+        root = Path(root).resolve()
+    except OSError:
+        return path, None
+    raw = Path(path).expanduser()
+    try:
+        if not raw.is_absolute():
+            cand = (root / raw).resolve()
+        else:
+            cand = raw.resolve()
+        cand.relative_to(root)
+    except ValueError:
+        return None, json.dumps(
+            {
+                "error": (
+                    "Multi-tenant API server: path must stay under the per-tenant "
+                    f"workspace {root}. Use relative paths or an absolute path inside that "
+                    f"directory. Got: {path!r}"
+                ),
+            },
+            ensure_ascii=False,
+        )
+    except OSError as e:
+        return None, json.dumps({"error": f"Invalid path: {path!r} ({e})"}, ensure_ascii=False)
+    return str(cand), None
+
+
 def _is_expected_write_exception(exc: Exception) -> bool:
     """Return True for expected write denials that should not hit error logs."""
     if isinstance(exc, PermissionError):
@@ -292,6 +329,10 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 500, task_id: str = 
                     "block or produce infinite output."
                 ),
             })
+
+        path, ws_err = _maybe_clamp_path_to_workspace(path)
+        if ws_err:
+            return ws_err
 
         _resolved = Path(path).expanduser().resolve()
 
@@ -540,6 +581,9 @@ def _check_file_staleness(filepath: str, task_id: str) -> str | None:
 
 def write_file_tool(path: str, content: str, task_id: str = "default") -> str:
     """Write content to a file."""
+    path, ws_err = _maybe_clamp_path_to_workspace(path)
+    if ws_err:
+        return ws_err
     sensitive_err = _check_sensitive_path(path)
     if sensitive_err:
         return tool_error(sensitive_err)
@@ -574,6 +618,16 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
         import re as _re
         for _m in _re.finditer(r'^\*\*\*\s+(?:Update|Add|Delete)\s+File:\s*(.+)$', patch, _re.MULTILINE):
             _paths_to_check.append(_m.group(1).strip())
+    clamped_paths: list[str] = []
+    for _p in _paths_to_check:
+        _cp, ws_err = _maybe_clamp_path_to_workspace(_p)
+        if ws_err:
+            return ws_err
+        if _cp is not None:
+            clamped_paths.append(_cp)
+    _paths_to_check = clamped_paths
+    if path and _paths_to_check:
+        path = _paths_to_check[0]
     for _p in _paths_to_check:
         sensitive_err = _check_sensitive_path(_p)
         if sensitive_err:
@@ -658,6 +712,10 @@ def search_tool(pattern: str, target: str = "content", path: str = ".",
                 "pattern": pattern,
                 "already_searched": count,
             }, ensure_ascii=False)
+
+        path, ws_err = _maybe_clamp_path_to_workspace(path)
+        if ws_err:
+            return ws_err
 
         file_ops = _get_file_ops(task_id)
         result = file_ops.search(

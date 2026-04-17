@@ -7,7 +7,7 @@ Exposes an HTTP server with endpoints:
 - GET  /v1/responses/{response_id} — Retrieve a stored response
 - DELETE /v1/responses/{response_id} — Delete a stored response
 - GET  /v1/models                  — lists hermes-agent as an available model
-- POST /v1/runs                    — start a run, returns run_id immediately (202)
+- POST /v1/runs                    — start a run, returns run_id immediately (202); stable body `session_id` restores prior turns from Session DB when `conversation_history` is omitted (Lumii / proxy clients)
 - GET  /v1/runs/{run_id}/events    — SSE stream of structured lifecycle events
 - GET  /health                     — health check
 - GET  /health/detailed            — rich status for cross-container dashboard probing
@@ -31,6 +31,7 @@ import re
 import sqlite3
 import time
 import uuid
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 try:
@@ -48,6 +49,53 @@ from gateway.platforms.base import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _api_server_partitioned_memory_root(session_id: Optional[str]) -> Path:
+    """Place MEMORY.md / USER.md under a per-user or per-session subdirectory.
+
+    Lumii uses ``lumii:<applicationId>:<userId>:<conversationId>`` — we key the
+    memory directory by (applicationId, userId) so one user shares USER.md across
+    conversations without colliding with other users. Opaque session ids get a
+    stable hash-based folder.
+    """
+    from hermes_constants import get_hermes_home
+
+    base = get_hermes_home() / "memories"
+    if not session_id or not str(session_id).strip():
+        return base
+    s = str(session_id).strip()
+    if s.startswith("lumii:"):
+        parts = s.split(":")
+        if len(parts) >= 4:
+            app, user = parts[1], parts[2]
+            seg = re.sub(r"[^a-zA-Z0-9._-]+", "_", f"{app}_{user}").strip("_")[:200] or "unknown"
+            return base / "lumii_users" / seg
+    h = hashlib.sha256(s.encode("utf-8")).hexdigest()[:48]
+    return base / "api_sessions" / h
+
+
+def _api_server_partitioned_workspace_root(session_id: Optional[str]) -> Path:
+    """Per-tenant directory for terminal cwd and file tool sandbox (parallel to memories/).
+
+    Uses the same ``lumii:`` / hash segmentation as :func:`_api_server_partitioned_memory_root`
+    so user A never shares disk with user B under ``HERMES_HOME/api_workspaces/``.
+    """
+    from hermes_constants import get_hermes_home
+
+    base = get_hermes_home() / "api_workspaces"
+    if not session_id or not str(session_id).strip():
+        return base / "_unscoped"
+    s = str(session_id).strip()
+    if s.startswith("lumii:"):
+        parts = s.split(":")
+        if len(parts) >= 4:
+            app, user = parts[1], parts[2]
+            seg = re.sub(r"[^a-zA-Z0-9._-]+", "_", f"{app}_{user}").strip("_")[:200] or "unknown"
+            return base / "lumii_users" / seg
+    h = hashlib.sha256(s.encode("utf-8")).hexdigest()[:48]
+    return base / "api_sessions" / h
+
 
 # Default settings
 DEFAULT_HOST = "127.0.0.1"
@@ -543,6 +591,15 @@ class APIServerAdapter(BasePlatformAdapter):
         from gateway.run import GatewayRunner
         fallback_model = GatewayRunner._load_fallback_model()
 
+        # File memory: partitioned per session/user by thread_memory_scope in _run_agent /v1/runs
+        # (see _api_server_partitioned_memory_root). Set HERMES_API_SERVER_SKIP_MEMORY=1 to disable.
+        skip_mem = os.getenv("HERMES_API_SERVER_SKIP_MEMORY", "").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
+
         agent = AIAgent(
             model=model,
             **runtime_kwargs,
@@ -559,6 +616,7 @@ class APIServerAdapter(BasePlatformAdapter):
             tool_complete_callback=tool_complete_callback,
             session_db=self._ensure_session_db(),
             fallback_model=fallback_model,
+            skip_memory=skip_mem,
         )
         return agent
 
@@ -2007,27 +2065,41 @@ class APIServerAdapter(BasePlatformAdapter):
         loop = asyncio.get_running_loop()
 
         def _run():
-            agent = self._create_agent(
-                ephemeral_system_prompt=ephemeral_system_prompt,
-                session_id=session_id,
-                stream_delta_callback=stream_delta_callback,
-                tool_progress_callback=tool_progress_callback,
-                tool_start_callback=tool_start_callback,
-                tool_complete_callback=tool_complete_callback,
+            from tools.api_server_workspace_scope import api_server_workspace_scope
+            from tools.memory_tool import thread_memory_scope
+
+            mem_root = _api_server_partitioned_memory_root(session_id)
+            ws_root = _api_server_partitioned_workspace_root(session_id)
+            _mem_off = os.getenv("HERMES_API_SERVER_SKIP_MEMORY", "").strip().lower() in ("1", "true", "yes", "on")
+            _ws_off = os.getenv("HERMES_API_SERVER_DISABLE_WORKSPACE_SANDBOX", "").strip().lower() in (
+                "1",
+                "true",
+                "yes",
+                "on",
             )
-            if agent_ref is not None:
-                agent_ref[0] = agent
-            result = agent.run_conversation(
-                user_message=user_message,
-                conversation_history=conversation_history,
-                task_id="default",
-            )
-            usage = {
-                "input_tokens": getattr(agent, "session_prompt_tokens", 0) or 0,
-                "output_tokens": getattr(agent, "session_completion_tokens", 0) or 0,
-                "total_tokens": getattr(agent, "session_total_tokens", 0) or 0,
-            }
-            return result, usage
+            with thread_memory_scope(None if _mem_off else mem_root):
+                with api_server_workspace_scope(None if _ws_off else ws_root):
+                    agent = self._create_agent(
+                        ephemeral_system_prompt=ephemeral_system_prompt,
+                        session_id=session_id,
+                        stream_delta_callback=stream_delta_callback,
+                        tool_progress_callback=tool_progress_callback,
+                        tool_start_callback=tool_start_callback,
+                        tool_complete_callback=tool_complete_callback,
+                    )
+                    if agent_ref is not None:
+                        agent_ref[0] = agent
+                    result = agent.run_conversation(
+                        user_message=user_message,
+                        conversation_history=conversation_history,
+                        task_id="default",
+                    )
+                    usage = {
+                        "input_tokens": getattr(agent, "session_prompt_tokens", 0) or 0,
+                        "output_tokens": getattr(agent, "session_completion_tokens", 0) or 0,
+                        "total_tokens": getattr(agent, "session_total_tokens", 0) or 0,
+                    }
+                    return result, usage
 
         return await loop.run_in_executor(None, _run)
 
@@ -2132,7 +2204,7 @@ class APIServerAdapter(BasePlatformAdapter):
 
         # Accept explicit conversation_history from the request body.
         # Precedence: explicit conversation_history > previous_response_id.
-        conversation_history: List[Dict[str, str]] = []
+        conversation_history: List[Dict[str, Any]] = []
         raw_history = body.get("conversation_history")
         if raw_history:
             if not isinstance(raw_history, list):
@@ -2174,29 +2246,68 @@ class APIServerAdapter(BasePlatformAdapter):
                         )
                     conversation_history.append({"role": msg["role"], "content": str(content)})
 
+        # Clients such as Lumii → AINO only send `input` + `session_id` (no prior turns in the
+        # body). Without this, each /v1/runs call would pass an empty history into
+        # run_conversation — the model only sees the latest user line. Reload from Session DB
+        # when session_id is explicit, mirroring /v1/chat/completions + X-Hermes-Session-Id.
+        explicit_session_id = body.get("session_id")
+        if (
+            not conversation_history
+            and isinstance(explicit_session_id, str)
+            and explicit_session_id.strip()
+            and not re.search(r"[\r\n\x00]", explicit_session_id)
+        ):
+            try:
+                db = self._ensure_session_db()
+                if db is not None:
+                    loaded = db.get_messages_as_conversation(explicit_session_id.strip())
+                    if loaded:
+                        conversation_history = list(loaded)
+            except Exception as e:
+                logger.warning(
+                    "Failed to load session history for /v1/runs session %s: %s",
+                    (explicit_session_id or "")[:120],
+                    e,
+                )
+
         session_id = body.get("session_id") or stored_session_id or run_id
         ephemeral_system_prompt = instructions
 
         async def _run_and_close():
             try:
-                agent = self._create_agent(
-                    ephemeral_system_prompt=ephemeral_system_prompt,
-                    session_id=session_id,
-                    stream_delta_callback=_text_cb,
-                    tool_progress_callback=event_cb,
+                mem_root = _api_server_partitioned_memory_root(session_id)
+                ws_root = _api_server_partitioned_workspace_root(session_id)
+                _mem_off = os.getenv("HERMES_API_SERVER_SKIP_MEMORY", "").strip().lower() in ("1", "true", "yes", "on")
+                _ws_off = os.getenv("HERMES_API_SERVER_DISABLE_WORKSPACE_SANDBOX", "").strip().lower() in (
+                    "1",
+                    "true",
+                    "yes",
+                    "on",
                 )
+
                 def _run_sync():
-                    r = agent.run_conversation(
-                        user_message=user_message,
-                        conversation_history=conversation_history,
-                        task_id="default",
-                    )
-                    u = {
-                        "input_tokens": getattr(agent, "session_prompt_tokens", 0) or 0,
-                        "output_tokens": getattr(agent, "session_completion_tokens", 0) or 0,
-                        "total_tokens": getattr(agent, "session_total_tokens", 0) or 0,
-                    }
-                    return r, u
+                    from tools.api_server_workspace_scope import api_server_workspace_scope
+                    from tools.memory_tool import thread_memory_scope
+
+                    with thread_memory_scope(None if _mem_off else mem_root):
+                        with api_server_workspace_scope(None if _ws_off else ws_root):
+                            agent = self._create_agent(
+                                ephemeral_system_prompt=ephemeral_system_prompt,
+                                session_id=session_id,
+                                stream_delta_callback=_text_cb,
+                                tool_progress_callback=event_cb,
+                            )
+                            r = agent.run_conversation(
+                                user_message=user_message,
+                                conversation_history=conversation_history,
+                                task_id="default",
+                            )
+                            u = {
+                                "input_tokens": getattr(agent, "session_prompt_tokens", 0) or 0,
+                                "output_tokens": getattr(agent, "session_completion_tokens", 0) or 0,
+                                "total_tokens": getattr(agent, "session_total_tokens", 0) or 0,
+                            }
+                            return r, u
 
                 result, usage = await asyncio.get_running_loop().run_in_executor(None, _run_sync)
                 final_response = result.get("final_response", "") if isinstance(result, dict) else ""

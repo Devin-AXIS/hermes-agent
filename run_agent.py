@@ -1210,7 +1210,19 @@ class AIAgent:
         if not skip_memory:
             try:
                 mem_config = _agent_cfg.get("memory", {})
-                self._memory_enabled = mem_config.get("memory_enabled", False)
+                # CLI/messaging default memory_enabled=False unless set in config. HTTP API Server
+                # uses partitioned MEMORY.md paths (api_server.py thread_memory_scope); default ON
+                # so the memory tool works without editing ~/.hermes/config.yaml. Set memory_enabled:
+                # false in config or HERMES_API_SERVER_DISABLE_FILE_MEMORY=1 to disable.
+                cfg_mem = mem_config.get("memory_enabled", None)
+                if cfg_mem is not None:
+                    self._memory_enabled = bool(cfg_mem)
+                elif (platform or "") == "api_server" and os.getenv(
+                    "HERMES_API_SERVER_DISABLE_FILE_MEMORY", ""
+                ).strip().lower() not in ("1", "true", "yes", "on"):
+                    self._memory_enabled = True
+                else:
+                    self._memory_enabled = False
                 self._user_profile_enabled = mem_config.get("user_profile_enabled", False)
                 self._memory_nudge_interval = int(mem_config.get("nudge_interval", 10))
                 self._memory_flush_min_turns = int(mem_config.get("flush_min_turns", 6))
