@@ -2618,6 +2618,9 @@ class GatewayRunner:
             Platform.BLUEBUBBLES: "BLUEBUBBLES_ALLOWED_USERS",
             Platform.QQBOT: "QQ_ALLOWED_USERS",
         }
+        platform_group_env_map = {
+            Platform.QQBOT: "QQ_GROUP_ALLOWED_USERS",
+        }
         platform_allow_all_map = {
             Platform.TELEGRAM: "TELEGRAM_ALLOW_ALL_USERS",
             Platform.DISCORD: "DISCORD_ALLOW_ALL_USERS",
@@ -2642,6 +2645,28 @@ class GatewayRunner:
         if platform_allow_all_var and os.getenv(platform_allow_all_var, "").lower() in ("true", "1", "yes"):
             return True
 
+        # Discord bot senders that passed the DISCORD_ALLOW_BOTS platform
+        # filter are already authorized at the platform level — skip the
+        # user allowlist. Without this, bot messages allowed by
+        # DISCORD_ALLOW_BOTS=mentions/all would be rejected here with
+        # "Unauthorized user" (fixes #4466).
+        if source.platform == Platform.DISCORD and getattr(source, "is_bot", False):
+            allow_bots = os.getenv("DISCORD_ALLOW_BOTS", "none").lower().strip()
+            if allow_bots in ("mentions", "all"):
+                return True
+
+        # Discord role-based access (DISCORD_ALLOWED_ROLES): the adapter's
+        # on_message pre-filter already verified role membership — if the
+        # message reached here, the user passed that check. Authorize
+        # directly to avoid the "no allowlists configured" branch below
+        # rejecting role-only setups where DISCORD_ALLOWED_USERS is empty
+        # (issue #7871).
+        if (
+            source.platform == Platform.DISCORD
+            and os.getenv("DISCORD_ALLOWED_ROLES", "").strip()
+        ):
+            return True
+
         # Check pairing store (always checked, regardless of allowlists)
         platform_name = source.platform.value if source.platform else ""
         if self.pairing_store.is_approved(platform_name, user_id):
@@ -2649,11 +2674,22 @@ class GatewayRunner:
 
         # Check platform-specific and global allowlists
         platform_allowlist = os.getenv(platform_env_map.get(source.platform, ""), "").strip()
+        group_allowlist = ""
+        if source.chat_type == "group":
+            group_allowlist = os.getenv(platform_group_env_map.get(source.platform, ""), "").strip()
         global_allowlist = os.getenv("GATEWAY_ALLOWED_USERS", "").strip()
 
-        if not platform_allowlist and not global_allowlist:
+        if not platform_allowlist and not group_allowlist and not global_allowlist:
             # No allowlists configured -- check global allow-all flag
             return os.getenv("GATEWAY_ALLOW_ALL_USERS", "").lower() in ("true", "1", "yes")
+
+        # Some platforms authorize group traffic by chat ID rather than sender ID.
+        if group_allowlist and source.chat_type == "group" and source.chat_id:
+            allowed_group_ids = {
+                chat_id.strip() for chat_id in group_allowlist.split(",") if chat_id.strip()
+            }
+            if "*" in allowed_group_ids or source.chat_id in allowed_group_ids:
+                return True
 
         # Check if user is in any allowlist
         allowed_ids = set()
@@ -5797,7 +5833,7 @@ class GatewayRunner:
                         pass
 
                 # Send media files
-                for media_path in (media_files or []):
+                for media_path, _is_voice in (media_files or []):
                     try:
                         await adapter.send_document(
                             chat_id=source.chat_id,
@@ -5975,7 +6011,7 @@ class GatewayRunner:
                 except Exception:
                     pass
 
-            for media_path in (media_files or []):
+            for media_path, _is_voice in (media_files or []):
                 try:
                     await adapter.send_file(chat_id=source.chat_id, file_path=media_path)
                 except Exception:
