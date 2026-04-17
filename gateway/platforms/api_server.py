@@ -600,6 +600,17 @@ class APIServerAdapter(BasePlatformAdapter):
             "on",
         )
 
+        # Ephemeral /tmp sandboxes from execute_code confuse Lumii users expecting disk under
+        # api_workspaces/lumii_users/.  Optionally strip the code_execution toolset (see model_tools).
+        api_disabled_toolsets: list[str] = []
+        if os.getenv("HERMES_API_SERVER_DISABLE_CODE_EXECUTION", "").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        ):
+            api_disabled_toolsets.append("code_execution")
+
         agent = AIAgent(
             model=model,
             **runtime_kwargs,
@@ -608,6 +619,7 @@ class APIServerAdapter(BasePlatformAdapter):
             verbose_logging=False,
             ephemeral_system_prompt=ephemeral_system_prompt or None,
             enabled_toolsets=enabled_toolsets,
+            disabled_toolsets=api_disabled_toolsets or None,
             session_id=session_id,
             platform="api_server",
             stream_delta_callback=stream_delta_callback,

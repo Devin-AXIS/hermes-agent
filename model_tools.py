@@ -205,7 +205,9 @@ def get_tool_definitions(
 
     Args:
         enabled_toolsets: Only include tools from these toolsets.
-        disabled_toolsets: Exclude tools from these toolsets (if enabled_toolsets is None).
+        disabled_toolsets: Exclude tools from these toolsets.  When ``enabled_toolsets``
+            is also set, disabled names are subtracted from the enabled union (e.g. API
+            server disabling ``code_execution`` while keeping other platform toolsets).
         quiet_mode: Suppress status prints.
 
     Returns:
@@ -253,6 +255,30 @@ def get_tool_definitions(
         from toolsets import get_all_toolsets
         for ts_name in get_all_toolsets():
             tools_to_include.update(resolve_toolset(ts_name))
+
+    # When both enabled_toolsets and disabled_toolsets are provided, subtract the
+    # latter (fixes api_server passing platform toolsets + e.g. code_execution off).
+    if enabled_toolsets is not None and disabled_toolsets:
+        for toolset_name in disabled_toolsets:
+            if validate_toolset(toolset_name):
+                resolved = resolve_toolset(toolset_name)
+                tools_to_include.difference_update(resolved)
+                if not quiet_mode:
+                    print(
+                        f"🚫 Disabled toolset '{toolset_name}' (after enable filter): "
+                        f"{', '.join(resolved) if resolved else 'no tools'}"
+                    )
+            elif toolset_name in _LEGACY_TOOLSET_MAP:
+                legacy_tools = _LEGACY_TOOLSET_MAP[toolset_name]
+                tools_to_include.difference_update(legacy_tools)
+                if not quiet_mode:
+                    print(
+                        f"🚫 Disabled legacy toolset '{toolset_name}' (after enable filter): "
+                        f"{', '.join(legacy_tools)}"
+                    )
+            else:
+                if not quiet_mode:
+                    print(f"⚠️  Unknown toolset: {toolset_name}")
 
     # Plugin-registered tools are now resolved through the normal toolset
     # path — validate_toolset() / resolve_toolset() / get_all_toolsets()
