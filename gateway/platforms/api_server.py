@@ -51,6 +51,27 @@ from gateway.platforms.base import (
 logger = logging.getLogger(__name__)
 
 
+def _derive_conv_session_id(conversation: str) -> str:
+    """Stable session_id for a Responses API ``conversation`` name.
+
+    Lumii/AINO always sends a deterministic ``lumii:<app>:<user>:<conv>``
+    conversation name but the Responses API originally minted a random
+    ``session_id`` per run. When a run was interrupted (client timeout,
+    network drop, app navigation), ``ResponseStore`` never got updated,
+    the conversation pointer stayed stale, AND the Session DB rows from
+    the aborted run sat under an un-referenceable random UUID — so the
+    next turn lost the previous user message entirely. Deriving a stable
+    ID from the conversation name anchors Session DB under the same key
+    for every turn, making it usable as a fallback when response_store
+    is missing the previous turn.
+
+    Keep the prefix short and within SessionDB's id length budget; the
+    sha256 hex is truncated to 32 chars which gives 128 bits of entropy.
+    """
+    h = hashlib.sha256(conversation.encode("utf-8")).hexdigest()[:32]
+    return f"resp-conv-{h}"
+
+
 def _api_server_partitioned_memory_root(session_id: Optional[str]) -> Path:
     """Place MEMORY.md / USER.md under a per-user or per-session subdirectory.
 
@@ -1534,15 +1555,34 @@ class APIServerAdapter(BasePlatformAdapter):
                 logger.debug("Both conversation_history and previous_response_id provided; using conversation_history")
 
         stored_session_id = None
+        response_store_miss = False
         if not conversation_history and previous_response_id:
             stored = self._response_store.get(previous_response_id)
             if stored is None:
-                return web.json_response(_openai_error(f"Previous response not found: {previous_response_id}"), status=404)
-            conversation_history = list(stored.get("conversation_history", []))
-            stored_session_id = stored.get("session_id")
-            # If no instructions provided, carry forward from previous
-            if instructions is None:
-                instructions = stored.get("instructions")
+                # A previously-known response was evicted from the LRU cache,
+                # OR the prior run was interrupted before completing. Instead
+                # of 404'ing (which drops the whole conversation), fall
+                # through and let the Session DB fallback below try to restore
+                # history from the stable conversation-derived session_id.
+                # Only error out when there's an explicit previous_response_id
+                # from the client AND no conversation name to fall back on.
+                if not conversation:
+                    return web.json_response(
+                        _openai_error(f"Previous response not found: {previous_response_id}"),
+                        status=404,
+                    )
+                response_store_miss = True
+                logger.info(
+                    "response_store miss for %s (conversation=%s); falling back to Session DB",
+                    previous_response_id,
+                    conversation,
+                )
+            else:
+                conversation_history = list(stored.get("conversation_history", []))
+                stored_session_id = stored.get("session_id")
+                # If no instructions provided, carry forward from previous
+                if instructions is None:
+                    instructions = stored.get("instructions")
 
         # Append new input messages to history (all but the last become history)
         for msg in input_messages[:-1]:
@@ -1557,9 +1597,58 @@ class APIServerAdapter(BasePlatformAdapter):
         if body.get("truncation") == "auto" and len(conversation_history) > 100:
             conversation_history = conversation_history[-100:]
 
-        # Reuse session from previous_response_id chain so the dashboard
-        # groups the entire conversation under one session entry.
-        session_id = stored_session_id or str(uuid.uuid4())
+        # Stable session_id derivation. When a client (Lumii / AINO) supplies a
+        # ``conversation`` name we anchor Session DB to a deterministic key so
+        # that an interrupted or evicted run can still be resumed. Random per-run
+        # UUIDs made the DB state unreachable from the next turn.
+        derived_conv_session_id = _derive_conv_session_id(conversation) if conversation else None
+        session_id = stored_session_id or derived_conv_session_id or str(uuid.uuid4())
+
+        # Session DB fallback: when the client passed a ``conversation`` name
+        # but we couldn't reconstruct history from the response store (first
+        # turn ever, run interrupted before store was written, or LRU eviction),
+        # try to load messages previously persisted by the agent under the
+        # stable session_id. Only runs when the turn is still new — we do not
+        # want to double-insert history that was already reconstructed from
+        # response_store.
+        input_history_from_body = len(input_messages) - 1 if input_messages else 0
+        if (
+            conversation
+            and len(conversation_history) <= input_history_from_body
+            and (response_store_miss or previous_response_id is None)
+        ):
+            try:
+                db = self._ensure_session_db()
+                if db is not None:
+                    loaded = db.get_messages_as_conversation(session_id)
+                    if loaded:
+                        # Drop any trailing user turn that duplicates the
+                        # incoming user_message — Session DB persists the last
+                        # user turn as soon as the agent sees it, but the
+                        # client is now re-sending that same text after an
+                        # interrupted run. Keep everything up to (but not
+                        # including) such a duplicate tail.
+                        tail_trim = 0
+                        for i in range(len(loaded) - 1, -1, -1):
+                            role = loaded[i].get("role")
+                            if role == "user":
+                                if str(loaded[i].get("content", "")).strip() == user_message.strip():
+                                    tail_trim = len(loaded) - i
+                                break
+                            if role in ("assistant", "tool"):
+                                break
+                        if tail_trim:
+                            loaded = loaded[:-tail_trim]
+                        # Merge: loaded history goes in front of any inline
+                        # input_messages[:-1] the client already appended.
+                        merged = list(loaded) + list(conversation_history)
+                        conversation_history = merged
+            except Exception as e:
+                logger.warning(
+                    "Failed to load session history for conversation %s: %s",
+                    str(conversation)[:120],
+                    e,
+                )
 
         stream = bool(body.get("stream", False))
         if stream:
